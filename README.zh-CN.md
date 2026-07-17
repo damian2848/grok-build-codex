@@ -8,7 +8,7 @@
 
 一个有状态的 Codex 插件，让 **Codex 负责需求规划、架构设计、代码审查和最终验收**，由本地 **Grok Build CLI 负责代码落地**。
 
-插件会在仓库内建立持久化的协作协议，把边界明确的实现任务交给 Grok，跟踪前台或后台任务，续接修复会话，最后将控制权交还 Codex，由 Codex 独立检查代码差异并运行验证。
+插件会在仓库内建立精简的协作协议，在独立后台 worker 中启动 Grok，把实时实现进度返回给 Codex，续接聚焦的修复会话，最后由 Codex 独立检查代码差异并运行验证。
 
 ## 工作流程
 
@@ -16,8 +16,10 @@
 flowchart LR
     U[用户需求] --> C[Codex 规划与架构设计]
     C --> H[.ai-collab 协作文件]
-    H --> B[有状态桥接器]
+    H --> B[独立后台桥接 Worker]
     B --> G[Grok Build CLI 代码实现]
+    B --> P[实时进度跟随器]
+    P --> C
     G --> W[工作区代码改动]
     W --> R[Codex 审查与验证]
     R -->|需要修复| H
@@ -29,12 +31,18 @@ flowchart LR
 - 需求、架构、验收标准和审查结论始终由 Codex 管理。
 - 通过 `.ai-collab/` 共享持久化上下文，不依赖模型之间不可见的隐藏状态。
 - 可选导入当前 Codex JSONL 会话记录到 Grok 会话。
-- 支持前台执行和可追踪的后台实现任务。
+- 在独立后台 worker 中执行实现任务，并通过紧凑 JSONL 事件实时跟随进度。
 - 保存任务状态、日志、桥接器 PID、Grok PID、输出内容和可恢复的 Grok 线程 ID。
+- 共享任务索引只保存必要元数据，避免跟随器每次刷新都重复解析大型提示词和输出。
+- 跟随器被中断或超时后，Grok worker 仍会继续运行。
+- Grok 提供数据时，终态事件会报告耗时、线程 ID、Token、API 耗时、轮次与成本。
+- 只流式输出 Grok 的可见文本，丢弃 `thought` 事件和私有推理内容。
+- 不做版本预探测，直接启动 Grok；启动或认证失败会写入可跟踪的终态事件。
 - 支持 `check`、`run`、`runs`、`show`、`stop`、`run-resume-candidate` 和 `import`。
 - 取消操作优先锁定终态，避免延迟结束的进程把 `cancelled` 覆盖成 `completed`。
+- 当任一任务具有写权限时，原子阻止同工作区重叠任务；自动恢复陈旧状态锁，并优先保留所有活动任务。
 - 委派任务不会授权 Grok 提交、推送、切换分支、执行破坏性 Git 命令或修改凭据。
-- 支持 macOS、Linux 和 Windows，包含 Node 入口、POSIX `.sh` 包装器、Windows `.cmd` 包装器以及 `taskkill` 进程树终止。
+- 支持 macOS、Linux 和 Windows，包含 Node 入口、POSIX `.sh` 包装器、Windows `.cmd` 包装器、私有临时提示词文件以及 `taskkill` 进程树终止。
 
 ## 环境要求
 
@@ -42,6 +50,8 @@ flowchart LR
 - Node.js `>= 18.18.0`。
 - Git。
 - 已在本机安装并完成认证的 Grok Build CLI。
+
+如果 Codex 自身运行在沙箱中，桥接器还需要出站网络权限以及 Grok 会话目录的写权限。POSIX 系统通常是 `$HOME/.grok`，Windows 是 `%USERPROFILE%\.grok`。
 
 安装插件前先验证 Grok：
 
@@ -87,7 +97,31 @@ codex plugin add grok-build-codex@grok-build-codex
 使用 $delegate-to-grok 规划这个任务，把代码实现交给 Grok，完成后审查改动并验收。
 ```
 
-Codex 会检查仓库、初始化 `.ai-collab/`、编写计划与验收标准、委派边界明确的任务、检查 Grok 生成的代码差异、运行验证，并决定验收或将聚焦的修复任务发回同一个 Grok 线程。
+Codex 会检查仓库、编写精简任务包、启动独立 Grok worker、展示实时进度、集中检查一次代码差异、运行约定的验证，并决定验收或将一次聚焦的修复任务发回同一个 Grok 线程。
+
+## 实时进度
+
+默认委派命令会在一次调用中启动后台 worker 并跟随其进度：
+
+```console
+node scripts/grok-bridge.mjs run --background --follow --stream --write --fresh --cwd /path/to/repository --prompt-file .ai-collab/task.md --model sub2api-grok
+```
+
+命令输出紧凑的逐行 JSON，Codex 任务可以直接将其展示为进度：
+
+```json
+{"type":"job.started","jobId":"task-...","status":"queued","progress":"Queued for background execution.","watcherDetachedSafe":true}
+{"type":"job.progress","jobId":"task-...","status":"running","phase":"running","elapsed":"4s","progress":"Updating the bridge tests.","watcherDetachedSafe":true}
+{"type":"job.completed","jobId":"task-...","status":"completed","duration":"8s","threadId":"...","metrics":{"totalTokens":220},"watcherDetachedSafe":true}
+```
+
+`job.timeout` 只表示跟随器停止等待，独立 Grok worker 仍会继续运行。可在不启动重复 worker 的情况下重新连接：
+
+```console
+node scripts/grok-bridge.mjs runs JOB_ID --follow --stream --cwd /path/to/repository
+```
+
+只有 Grok 长时间运行且主 Codex 智能体有不冲突的工作可做时，才使用一个轻量、只读的监控子智能体。普通任务应直接使用内置跟随器，避免额外的编排延迟和 Token 消耗。
 
 ## 协作文件
 
@@ -107,7 +141,8 @@ Codex 会检查仓库、初始化 `.ai-collab/`、编写计划与验收标准、
 
 ```console
 node scripts/grok-bridge.mjs check --cwd /path/to/repository --json
-node scripts/grok-bridge.mjs run --write --fresh --cwd /path/to/repository --prompt-file .ai-collab/task.md --json
+node scripts/grok-bridge.mjs run --background --follow --stream --write --fresh --cwd /path/to/repository --prompt-file .ai-collab/task.md --model sub2api-grok
+node scripts/grok-bridge.mjs runs JOB_ID --follow --stream --cwd /path/to/repository
 node scripts/grok-bridge.mjs runs --cwd /path/to/repository --json
 node scripts/grok-bridge.mjs show JOB_ID --cwd /path/to/repository --json
 node scripts/grok-bridge.mjs stop JOB_ID --cwd /path/to/repository --json
@@ -150,7 +185,9 @@ npm test
 node --check scripts/grok-bridge.mjs
 ```
 
-测试包含跨平台 Node 入口，以及针对 Windows 命令执行、进程树终止和状态文件替换的模拟覆盖。GitHub Actions 会在 Linux、macOS 和 Windows 上运行测试。
+测试包含跨平台 Node 入口、后台状态竞态、紧凑索引、worker 启动失败处理，以及针对 Windows 命令执行、提示词文件、进程树终止和状态文件替换的模拟覆盖。GitHub Actions 会在 Linux、macOS 和 Windows 上运行测试。
+
+优化后的路径会在同一进程内分发适配器、缓存仓库解析、保持 `state.json` 紧凑，并通过一次 `--prompt-file` 调用 Grok。普通任务不会预先执行 `grok version` 或 `grok models`；启动与认证失败会记录到对应任务。仅在首次配置、认证变化或出现此类失败后使用 `check --json`。
 
 ## 上游归属
 

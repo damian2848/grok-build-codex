@@ -9,6 +9,13 @@ Use two state layers:
 
 The Codex adapter maps `CODEX_THREAD_ID` to the upstream bridge's session ownership field. This lets `runs` and `run-resume-candidate` prefer jobs started from the current Codex task.
 
+The default execution path has two processes:
+
+1. A detached bridge worker owns the Grok process and persists job state.
+2. A lightweight follower reads persisted progress and emits compact events to Codex.
+
+Stopping, interrupting, or timing out the follower does not terminate the worker. Cancellation must go through `stop`.
+
 ## Workflow State
 
 Use these phases in `.ai-collab/state.json`:
@@ -64,6 +71,41 @@ Codex adapter additions:
 - `status`: alias for `runs`.
 - `cancel`: alias for `stop`.
 
+## Fast Delegation Path
+
+For normal implementation work, use one compact handoff and one bridge command:
+
+```text
+node <skill-dir>/../../scripts/grok-bridge.mjs run --background --follow --stream --write --fresh --cwd <workspace> --prompt-file .ai-collab/task.md --model sub2api-grok
+```
+
+`run --follow` always launches a detached worker before following it. Do not add shell polling around this command. Use `runs <job-id> --follow --stream` to reconnect to an existing worker.
+
+The run path invokes Grok directly and does not execute a version or models probe first. Binary, startup, and authentication failures are recorded as tracked terminal failures. Use the standalone `check` command for first-time setup, authentication changes, or after one of those failures.
+
+For bounded work, `.ai-collab/task.md` plus `state.json` is sufficient. Split context, plan, and acceptance into separate files only when the task is large enough to benefit from them. Transcript import is optional and should be used only when the repository handoff cannot carry required context.
+
+## Follower Event Contract
+
+With `--stream`, stdout is newline-delimited JSON. Event types are:
+
+- `job.started`: the detached worker was queued and includes its `jobId`.
+- `job.progress`: status, phase, elapsed time, and the latest visible Grok text progress.
+- `job.completed`, `job.failed`, or `job.cancelled`: terminal status with thread, duration, summary, error, and metrics when available.
+- `job.timeout`: the follower reached `--timeout-ms`; the detached worker is still running.
+
+Every event includes `watcherDetachedSafe: true`. Terminal `metrics` can include input, cached input, output, reasoning, and total tokens, model calls, API duration, turns, and cost when Grok reports them.
+
+The Grok process uses `streaming-json`. Only user-visible `text` events enter progress and stored output. `thought` events and other private reasoning are deliberately discarded. Non-JSON stdout is retained as a compatibility fallback.
+
+Follower tuning options:
+
+- `--timeout-ms`: stop following without cancelling the worker.
+- `--poll-interval-ms`: persisted-state refresh interval.
+- `--heartbeat-ms`: maximum quiet interval before a heartbeat progress event.
+
+Do not use a Codex subagent only to poll. One read-only monitor subagent is appropriate only for a genuinely long task when the main Codex agent has useful, non-conflicting work. Its sole responsibility is following the known job and returning the terminal event.
+
 ## Session Rules
 
 - Let the bridge create a random UUID for every fresh Grok thread.
@@ -77,8 +119,10 @@ Codex adapter additions:
 The bundled runtime follows the xAI reference implementation:
 
 - write the job file before spawning the detached worker;
+- reserve jobs atomically and reject same-workspace overlap when either active or candidate work can write;
 - track `bridgePid` and `agentPid` separately;
-- use atomic writes and a state lock;
+- keep full requests/results in per-job files and only compact metadata in the shared index;
+- use atomic writes, recover abandoned state locks, and prune terminal history before active jobs;
 - claim terminal state with compare-and-set semantics;
 - let `cancelled` win over late `completed` writes;
 - stop both process trees when available.
@@ -125,6 +169,8 @@ Codex must verify:
 - preservation of user changes;
 - absence of unexpected commits or branch movement.
 
+Review the diff once after the terminal event and run the declared validation once. Request a repair only for a concrete contract or acceptance failure. Default to one focused repair through `--resume`; additional rounds require user authorization unless already requested.
+
 ## Failure Handling
 
 - If Grok exits nonzero, inspect the worktree before retrying because partial edits may exist.
@@ -133,3 +179,5 @@ Codex must verify:
 - If concurrent edits appear, stop and reconcile ownership before another run.
 - If the same finding persists after two repairs, stop the loop and report it.
 - If cancellation reports a process may still be running, inspect `runs <job-id>` and the stored PID details before starting another worker.
+- If a follower times out, reconnect with `runs <job-id> --follow --stream`; do not start a duplicate worker.
+- If Codex sandboxing blocks network access or Grok session storage, enable network access and make the user Grok directory writable. POSIX environments commonly need `--add-dir "$HOME/.grok"`; Windows needs the equivalent `%USERPROFILE%\.grok` directory.

@@ -39,8 +39,8 @@ import {
   generateJobId,
   listJobs,
   patchJobIfActive,
-  upsertJob,
-  writeJobFile
+  reserveJob,
+  resolveJobLogFile
 } from "./lib/state.mjs";
 import {
   appendLogLine,
@@ -69,6 +69,12 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const DEFAULT_FOLLOW_TIMEOUT_MS = 1800000;
+const DEFAULT_FOLLOW_POLL_INTERVAL_MS = 500;
+const DEFAULT_FOLLOW_HEARTBEAT_MS = 15000;
+const FOLLOW_PROGRESS_LIMIT = 320;
+const FOLLOW_SUMMARY_LIMIT = 240;
+const FOLLOW_ERROR_LIMIT = 1000;
 const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high"]);
 
 function printUsage() {
@@ -78,9 +84,9 @@ function printUsage() {
       "  node scripts/grok-bridge.mjs check [--json]",
       "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>]",
       "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [focus text]",
-      "  node scripts/grok-bridge.mjs run [--background] [--write] [--resume-last|--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [prompt]",
+      "  node scripts/grok-bridge.mjs run [--background] [--follow] [--stream] [--write] [--resume-last|--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [prompt]",
       "  node scripts/grok-bridge.mjs import [--source <claude-jsonl>] [--json]",
-      "  node scripts/grok-bridge.mjs runs [run-id] [--all] [--json]",
+      "  node scripts/grok-bridge.mjs runs [run-id] [--all|--wait|--follow] [--stream|--json]",
       "  node scripts/grok-bridge.mjs show [run-id] [--json]",
       "  node scripts/grok-bridge.mjs stop [run-id] [--json]"
     ].join("\n")
@@ -179,7 +185,7 @@ function firstMeaningfulLine(text, fallback) {
 async function buildCheckReport(cwd, actionsTaken = []) {
   const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
   const grokStatus = getGrokAvailability(cwd);
-  const authStatus = getGrokAuthStatus(cwd);
+  const authStatus = getGrokAuthStatus(cwd, { availability: grokStatus });
 
   const nextSteps = [];
   if (!grokStatus.available) {
@@ -221,15 +227,6 @@ function buildCritiquePrompt(context, focusText) {
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
     REVIEW_INPUT: context.content
   });
-}
-
-function ensureGrokAvailable(cwd) {
-  const availability = getGrokAvailability(cwd);
-  if (!availability.available) {
-    throw new Error(
-      "Grok CLI is not installed or not on PATH. Install it, set GROK_BINARY if needed, then rerun `/grok-build:check`."
-    );
-  }
 }
 
 function renderStatusPayload(report, asJson) {
@@ -278,6 +275,138 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
+function readDurationOption(value, fallback, minimum = 0) {
+  if (value == null || value === "") {
+    return fallback;
+  }
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) {
+    throw new Error(`Expected a non-negative duration in milliseconds, received "${value}".`);
+  }
+  return Math.max(minimum, number);
+}
+
+function buildFollowEvent(type, snapshot, options = {}) {
+  const job = snapshot.job;
+  const storedJob = options.terminal
+    ? readStoredJob(snapshot.workspaceRoot, job.id)
+    : null;
+  const progress = job.progressPreview?.at(-1) ?? options.lastProgress ?? null;
+  const summary = options.terminal ? storedJob?.summary ?? job.summary ?? null : null;
+  const errorMessage = options.terminal
+    ? storedJob?.errorMessage ?? storedJob?.result?.errorMessage ?? null
+    : null;
+  return {
+    type,
+    jobId: job.id,
+    status: job.status,
+    phase: job.phase ?? null,
+    elapsed: job.elapsed ?? null,
+    duration: job.duration ?? null,
+    threadId: job.threadId ?? storedJob?.threadId ?? null,
+    progress: progress ? shorten(progress, FOLLOW_PROGRESS_LIMIT) : null,
+    summary: summary ? shorten(summary, FOLLOW_SUMMARY_LIMIT) : null,
+    metrics: options.terminal ? storedJob?.result?.metrics ?? null : null,
+    errorMessage: errorMessage ? shorten(errorMessage, FOLLOW_ERROR_LIMIT) : null,
+    logFile: job.logFile ?? storedJob?.logFile ?? null,
+    watcherDetachedSafe: true,
+    heartbeat: Boolean(options.heartbeat)
+  };
+}
+
+function renderFollowEvent(event) {
+  const details = [event.status, event.phase, event.elapsed]
+    .filter(Boolean)
+    .join(" | ");
+  const progress = event.progress ? ` | ${event.progress}` : "";
+  return `[grok-codex] ${event.jobId} | ${details}${progress}\n`;
+}
+
+function emitFollowEvent(event, options = {}) {
+  if (options.silent) {
+    return;
+  }
+  if (options.stream) {
+    process.stdout.write(`${JSON.stringify(event)}\n`);
+    return;
+  }
+  process.stdout.write(renderFollowEvent(event));
+}
+
+function followEventType(status) {
+  if (status === "completed") return "job.completed";
+  if (status === "failed") return "job.failed";
+  if (status === "cancelled") return "job.cancelled";
+  return "job.progress";
+}
+
+function followFingerprint(snapshot) {
+  const latestProgress = snapshot.job.progressPreview?.at(-1) ?? null;
+  return JSON.stringify([
+    snapshot.job.status,
+    snapshot.job.phase,
+    snapshot.job.threadId,
+    latestProgress
+  ]);
+}
+
+async function followSingleJob(cwd, reference, options = {}) {
+  const timeoutMs = readDurationOption(options.timeoutMs, DEFAULT_FOLLOW_TIMEOUT_MS);
+  const pollIntervalMs = readDurationOption(
+    options.pollIntervalMs,
+    DEFAULT_FOLLOW_POLL_INTERVAL_MS,
+    25
+  );
+  const heartbeatMs = readDurationOption(
+    options.heartbeatMs,
+    DEFAULT_FOLLOW_HEARTBEAT_MS,
+    250
+  );
+  const deadline = Date.now() + timeoutMs;
+  let lastFingerprint = options.initialFingerprint ?? null;
+  let lastHeartbeatAt = lastFingerprint ? Date.now() : 0;
+  let lastProgress = options.lastProgress ?? null;
+  let snapshot = buildSingleJobSnapshot(cwd, reference);
+
+  while (true) {
+    const latestProgress = snapshot.job.progressPreview?.at(-1) ?? null;
+    if (latestProgress) {
+      lastProgress = latestProgress;
+    }
+    const active = isActiveJobStatus(snapshot.job.status);
+    const now = Date.now();
+    const fingerprint = followFingerprint(snapshot);
+    const heartbeat = active && now - lastHeartbeatAt >= heartbeatMs;
+
+    if (fingerprint !== lastFingerprint || heartbeat || !active) {
+      const event = buildFollowEvent(followEventType(snapshot.job.status), snapshot, {
+        terminal: !active,
+        heartbeat: heartbeat && fingerprint === lastFingerprint,
+        lastProgress
+      });
+      emitFollowEvent(event, options);
+      lastFingerprint = fingerprint;
+      lastHeartbeatAt = now;
+      if (!active) {
+        return { snapshot, event, waitTimedOut: false, timeoutMs };
+      }
+    }
+
+    if (now >= deadline) {
+      const event = {
+        ...buildFollowEvent("job.timeout", snapshot, { lastProgress }),
+        waitTimedOut: true,
+        timeoutMs
+      };
+      emitFollowEvent(event, options);
+      return { snapshot, event, waitTimedOut: true, timeoutMs };
+    }
+
+    await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - now)));
+    snapshot = buildSingleJobSnapshot(cwd, reference);
+  }
+}
+
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
@@ -296,7 +425,6 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
 }
 
 async function executeReviewRun(request) {
-  ensureGrokAvailable(request.cwd);
   ensureGitRepository(request.cwd);
 
   const target = resolveReviewTarget(request.cwd, {
@@ -370,10 +498,12 @@ async function executeReviewRun(request) {
         reviewLabel: reviewName,
         targetLabel: context.target.label
       }),
-      summary:
+      summary: shorten(
         parsed.parsed?.summary ??
-        parsed.parseError ??
-        firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+          parsed.parseError ??
+          firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+        FOLLOW_SUMMARY_LIMIT
+      ),
       jobTitle: `Grok Build ${reviewName}`,
       jobClass: "review",
       targetLabel: context.target.label
@@ -405,7 +535,10 @@ async function executeReviewRun(request) {
     turnId: null,
     payload,
     rendered,
-    summary: firstMeaningfulLine(result.finalMessage, `${reviewName} completed.`),
+    summary: shorten(
+      firstMeaningfulLine(result.finalMessage, `${reviewName} completed.`),
+      FOLLOW_SUMMARY_LIMIT
+    ),
     jobTitle: `Grok Build ${reviewName}`,
     jobClass: "review",
     targetLabel: target.label
@@ -414,7 +547,6 @@ async function executeReviewRun(request) {
 
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
-  ensureGrokAvailable(request.cwd);
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
@@ -447,7 +579,7 @@ async function executeTaskRun(request) {
     alwaysApprove: write,
     permissionMode: write ? undefined : "plan",
     sandbox: write ? undefined : "read-only",
-    outputFormat: "plain",
+    outputFormat: "streaming-json",
     onProgress: request.onProgress
   });
 
@@ -467,7 +599,9 @@ async function executeTaskRun(request) {
   const payload = {
     status: result.status,
     threadId: result.threadId,
-    rawOutput
+    rawOutput,
+    errorMessage: result.status === 0 ? null : failureMessage.trim() || null,
+    metrics: result.metrics ?? null
   };
 
   return {
@@ -476,7 +610,10 @@ async function executeTaskRun(request) {
     turnId: null,
     payload,
     rendered,
-    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    summary: shorten(
+      firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+      FOLLOW_SUMMARY_LIMIT
+    ),
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write
@@ -563,7 +700,6 @@ function renderTransferResult(payload) {
 }
 
 async function executeTransfer(cwd, options = {}) {
-  ensureGrokAvailable(cwd);
   const sourcePath = resolveClaudeSessionPath(cwd, {
     source: options.source
   });
@@ -598,11 +734,14 @@ function requireTaskRequest(prompt, resumeLast) {
 }
 
 async function runForegroundCommand(job, runner, options = {}) {
-  const { logFile, progress } = createTrackedProgress(job, {
-    logFile: options.logFile,
+  const { job: reservedJob, logFile } = reserveTrackedJob(job, {
+    logFile: options.logFile
+  });
+  const { progress } = createTrackedProgress(reservedJob, {
+    logFile,
     stderr: !options.json
   });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  const execution = await runTrackedJob(reservedJob, () => runner(progress), { logFile });
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
@@ -623,10 +762,16 @@ function spawnDetachedRunWorker(cwd, jobId) {
   return child;
 }
 
-export function enqueueBackgroundJob(cwd, job, request, options = {}) {
-  const { logFile } = createTrackedProgress(job);
-  appendLogLine(logFile, "Queued for background execution.");
+function describeReservationConflict(reservation) {
+  const conflict = reservation.conflict;
+  if (!conflict) {
+    return "A conflicting tracked run already exists.";
+  }
+  return `Run ${conflict.id} is already ${conflict.status} in this workspace. Wait for it or stop it before starting another run that may overlap with its worktree.`;
+}
 
+function reserveTrackedJob(job, options = {}) {
+  const logFile = options.logFile ?? resolveJobLogFile(job.workspaceRoot, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
@@ -635,25 +780,68 @@ export function enqueueBackgroundJob(cwd, job, request, options = {}) {
     agentPid: null,
     bridgePid: null,
     logFile,
-    request
+    ...(options.request ? { request: options.request } : {})
   };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+  const reservation = reserveJob(job.workspaceRoot, queuedRecord);
+  if (!reservation.reserved) {
+    throw new Error(describeReservationConflict(reservation));
+  }
+
+  try {
+    createJobLogFile(job.workspaceRoot, job.id, job.title);
+  } catch (error) {
+    claimJobTerminal(job.workspaceRoot, job.id, "failed", {
+      errorMessage: error instanceof Error ? error.message : String(error),
+      phase: "failed",
+      logFile
+    });
+    throw error;
+  }
+
+  return { job: reservation.job, logFile };
+}
+
+export function enqueueBackgroundJob(cwd, job, request, options = {}) {
+  const { logFile } = reserveTrackedJob(job, { request });
+  appendLogLine(logFile, "Queued for background execution.");
 
   const spawnWorker = options.spawnWorker ?? spawnDetachedRunWorker;
-  const child = spawnWorker(cwd, job.id);
-  const workerPid = child?.pid ?? null;
-  if (workerPid != null) {
-    patchJobIfActive(job.workspaceRoot, job.id, {
-      status: "queued",
-      phase: "queued",
-      pid: workerPid,
-      bridgePid: workerPid,
-      agentPid: null,
-      logFile,
-      request
+  let child;
+  try {
+    child = spawnWorker(cwd, job.id);
+  } catch (error) {
+    claimJobTerminal(job.workspaceRoot, job.id, "failed", {
+      errorMessage: error instanceof Error ? error.message : String(error),
+      phase: "failed",
+      logFile
     });
+    throw error;
   }
+  child?.once?.("error", (error) => {
+    try {
+      claimJobTerminal(job.workspaceRoot, job.id, "failed", {
+        errorMessage: error instanceof Error ? error.message : String(error),
+        phase: "failed",
+        logFile
+      });
+      appendLogLine(logFile, `Detached worker failed to start: ${error instanceof Error ? error.message : String(error)}`);
+    } catch {
+    }
+  });
+  const workerPid = child?.pid ?? null;
+  if (!Number.isInteger(workerPid) || workerPid <= 0) {
+    const error = new Error(`Failed to start the detached bridge worker for ${job.id}.`);
+    claimJobTerminal(job.workspaceRoot, job.id, "failed", {
+      errorMessage: error.message,
+      phase: "failed",
+      logFile
+    });
+    throw error;
+  }
+  patchJobIfActive(job.workspaceRoot, job.id, {
+    pid: workerPid,
+    bridgePid: workerPid
+  });
 
   return {
     payload: {
@@ -710,7 +898,6 @@ async function handleReviewCommand(argv, config) {
   };
 
   if (options.background && !options.wait) {
-    ensureGrokAvailable(cwd);
     const { payload } = enqueueBackgroundJob(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
@@ -729,8 +916,25 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: [
+      "model",
+      "effort",
+      "cwd",
+      "prompt-file",
+      "timeout-ms",
+      "poll-interval-ms",
+      "heartbeat-ms"
+    ],
+    booleanOptions: [
+      "json",
+      "write",
+      "resume-last",
+      "resume",
+      "fresh",
+      "background",
+      "follow",
+      "stream"
+    ],
     aliasMap: {
       m: "model"
     }
@@ -753,8 +957,14 @@ async function handleTask(argv) {
     resumeLast
   });
 
-  if (options.background) {
-    ensureGrokAvailable(cwd);
+  if (options.stream && !options.follow) {
+    throw new Error("`run --stream` requires `--follow`.");
+  }
+  if (options.stream && options.json) {
+    throw new Error("Choose either `--stream` for JSONL events or `--json` for one final object.");
+  }
+
+  if (options.background || options.follow) {
     requireTaskRequest(prompt, resumeLast);
 
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
@@ -771,7 +981,48 @@ async function handleTask(argv) {
       })
     };
     const { payload } = enqueueBackgroundJob(cwd, job, request);
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    if (!options.follow) {
+      outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+      return;
+    }
+
+    const startedEvent = {
+      type: "job.started",
+      jobId: payload.jobId,
+      status: payload.status,
+      phase: "queued",
+      elapsed: "0s",
+      duration: null,
+      threadId: null,
+      progress: "Queued for background execution.",
+      summary: payload.summary,
+      metrics: null,
+      errorMessage: null,
+      logFile: payload.logFile,
+      watcherDetachedSafe: true,
+      heartbeat: false
+    };
+    emitFollowEvent(startedEvent, { stream: options.stream, silent: options.json });
+    const followed = await followSingleJob(cwd, payload.jobId, {
+      timeoutMs: options["timeout-ms"],
+      pollIntervalMs: options["poll-interval-ms"],
+      heartbeatMs: options["heartbeat-ms"],
+      stream: options.stream,
+      silent: options.json,
+      initialFingerprint: JSON.stringify([
+        startedEvent.status,
+        startedEvent.phase,
+        startedEvent.threadId,
+        startedEvent.progress
+      ]),
+      lastProgress: startedEvent.progress
+    });
+    if (options.json) {
+      outputResult(followed.event, true);
+    }
+    if (!followed.waitTimedOut && followed.snapshot.job.status === "failed") {
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -831,25 +1082,53 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = await readStoredJobWithRetry(workspaceRoot, options["job-id"]);
-  if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
-  }
+  const jobId = options["job-id"];
+  let storedJob = null;
+  let logFile = null;
+  let progress = null;
+  let request = null;
 
-  const request = storedJob.request;
-  if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its run request payload.`);
-  }
-
-  const { logFile, progress } = createTrackedProgress(
-    {
-      ...storedJob,
-      workspaceRoot
-    },
-    {
-      logFile: storedJob.logFile ?? null
+  try {
+    storedJob = await readStoredJobWithRetry(workspaceRoot, jobId);
+    if (!storedJob) {
+      throw new Error(`No stored job found for ${jobId}.`);
     }
-  );
+
+    request = storedJob.request;
+    if (!request || typeof request !== "object") {
+      throw new Error(`Stored job ${jobId} is missing its run request payload.`);
+    }
+
+    ({ logFile, progress } = createTrackedProgress(
+      {
+        ...storedJob,
+        workspaceRoot
+      },
+      {
+        logFile: storedJob.logFile ?? null
+      }
+    ));
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    let failureLog = storedJob?.logFile ?? null;
+    try {
+      const claim = claimJobTerminal(workspaceRoot, jobId, "failed", {
+        errorMessage,
+        phase: "failed",
+        pid: null,
+        agentPid: null,
+        bridgePid: null,
+        logFile: failureLog
+      });
+      failureLog = failureLog ?? claim.job?.logFile ?? null;
+    } catch {
+    }
+    try {
+      appendLogLine(failureLog, `Worker bootstrap failed: ${errorMessage}`);
+    } catch {
+    }
+    throw error;
+  }
 
   const runner =
     request.kind === "review" || storedJob.jobClass === "review"
@@ -869,13 +1148,35 @@ async function handleTaskWorker(argv) {
 
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
-    booleanOptions: ["json", "all", "wait"]
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms", "heartbeat-ms"],
+    booleanOptions: ["json", "all", "wait", "follow", "stream"]
   });
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
+  if (options.stream && !options.follow) {
+    throw new Error("`runs --stream` requires `--follow`.");
+  }
+  if (options.stream && options.json) {
+    throw new Error("Choose either `--stream` for JSONL events or `--json` for one final object.");
+  }
   if (reference) {
+    if (options.follow) {
+      const followed = await followSingleJob(cwd, reference, {
+        timeoutMs: options["timeout-ms"],
+        pollIntervalMs: options["poll-interval-ms"],
+        heartbeatMs: options["heartbeat-ms"],
+        stream: options.stream,
+        silent: options.json
+      });
+      if (options.json) {
+        outputResult(followed.event, true);
+      }
+      if (!followed.waitTimedOut && followed.snapshot.job.status === "failed") {
+        process.exitCode = 1;
+      }
+      return;
+    }
     const snapshot = options.wait
       ? await waitForSingleJobSnapshot(cwd, reference, {
           timeoutMs: options["timeout-ms"],
@@ -886,8 +1187,8 @@ async function handleStatus(argv) {
     return;
   }
 
-  if (options.wait) {
-    throw new Error("`runs --wait` requires a run id.");
+  if (options.wait || options.follow) {
+    throw new Error("`runs --wait` and `runs --follow` require a run id.");
   }
 
   const report = buildStatusSnapshot(cwd, { all: options.all });
@@ -1099,4 +1400,4 @@ if (isMain) {
   });
 }
 
-export { main, readStoredJobWithRetry };
+export { handleTaskWorker, main, readStoredJobWithRetry };

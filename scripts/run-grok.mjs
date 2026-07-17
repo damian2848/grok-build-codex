@@ -17,6 +17,11 @@ function usage() {
   process.stdout.write(`  --model MODEL          Optional Grok model or configured alias\n`);
   process.stdout.write(`  --effort LEVEL         Optional low, medium, or high effort\n`);
   process.stdout.write(`  --background           Queue a tracked background run\n`);
+  process.stdout.write(`  --follow               Follow a detached run with compact live progress\n`);
+  process.stdout.write(`  --stream               Emit follower events as JSONL (requires --follow)\n`);
+  process.stdout.write(`  --timeout-ms MS        Stop following after this duration; job keeps running\n`);
+  process.stdout.write(`  --poll-interval-ms MS  Follower state refresh interval\n`);
+  process.stdout.write(`  --heartbeat-ms MS      Follower heartbeat interval\n`);
   process.stdout.write(`  --resume               Continue the latest tracked Grok thread\n`);
   process.stdout.write(`  --fresh                Force a new Grok thread\n`);
   process.stdout.write(`  --json                 Emit bridge JSON\n`);
@@ -37,6 +42,11 @@ export function buildBridgeArgs(argv) {
   let model = null;
   let effort = null;
   let background = false;
+  let follow = false;
+  let stream = false;
+  let timeoutMs = null;
+  let pollIntervalMs = null;
+  let heartbeatMs = null;
   let resume = false;
   let fresh = false;
   let json = false;
@@ -57,6 +67,19 @@ export function buildBridgeArgs(argv) {
       index += 1;
     } else if (argument === "--background") {
       background = true;
+    } else if (argument === "--follow") {
+      follow = true;
+    } else if (argument === "--stream") {
+      stream = true;
+    } else if (argument === "--timeout-ms") {
+      timeoutMs = readValue(argv, index, argument);
+      index += 1;
+    } else if (argument === "--poll-interval-ms") {
+      pollIntervalMs = readValue(argv, index, argument);
+      index += 1;
+    } else if (argument === "--heartbeat-ms") {
+      heartbeatMs = readValue(argv, index, argument);
+      index += 1;
     } else if (argument === "--resume") {
       resume = true;
     } else if (argument === "--fresh") {
@@ -86,6 +109,11 @@ export function buildBridgeArgs(argv) {
   if (model) bridgeArgs.push("--model", model);
   if (effort) bridgeArgs.push("--effort", effort);
   if (background) bridgeArgs.push("--background");
+  if (follow) bridgeArgs.push("--follow");
+  if (stream) bridgeArgs.push("--stream");
+  if (timeoutMs) bridgeArgs.push("--timeout-ms", timeoutMs);
+  if (pollIntervalMs) bridgeArgs.push("--poll-interval-ms", pollIntervalMs);
+  if (heartbeatMs) bridgeArgs.push("--heartbeat-ms", heartbeatMs);
   if (resume) bridgeArgs.push("--resume");
   if (fresh) bridgeArgs.push("--fresh");
   if (json) bridgeArgs.push("--json");

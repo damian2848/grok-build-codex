@@ -6,6 +6,7 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+const DEFAULT_PROGRESS_TAIL_BYTES = 64 * 1024;
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -68,8 +69,24 @@ export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_
     return [];
   }
 
-  const lines = fs
-    .readFileSync(logFile, "utf8")
+  const fd = fs.openSync(logFile, "r");
+  let text = "";
+  try {
+    const stat = fs.fstatSync(fd);
+    const length = Math.min(stat.size, DEFAULT_PROGRESS_TAIL_BYTES);
+    const start = Math.max(0, stat.size - length);
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, start);
+    text = buffer.toString("utf8");
+    if (start > 0) {
+      const firstLineEnd = text.indexOf("\n");
+      text = firstLineEnd === -1 ? "" : text.slice(firstLineEnd + 1);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  const lines = text
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter(Boolean)

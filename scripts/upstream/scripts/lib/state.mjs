@@ -14,6 +14,36 @@ const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 const LOCK_MAX_ATTEMPTS = 100;
 const LOCK_RETRY_MS = 20;
+const LOCK_STALE_MS = 30000;
+const MAX_INDEX_SUMMARY_LENGTH = 240;
+const MAX_INDEX_ERROR_LENGTH = 1000;
+const JOB_INDEX_FIELDS = [
+  "id",
+  "kind",
+  "kindLabel",
+  "title",
+  "workspaceRoot",
+  "jobClass",
+  "summary",
+  "write",
+  "sessionId",
+  "status",
+  "phase",
+  "createdAt",
+  "updatedAt",
+  "startedAt",
+  "completedAt",
+  "cancelledAt",
+  "threadId",
+  "turnId",
+  "pid",
+  "agentPid",
+  "bridgePid",
+  "companionPid",
+  "logFile",
+  "errorMessage"
+];
+const stateDirCache = new Map();
 
 function nowIso() {
   return new Date().toISOString();
@@ -48,6 +78,14 @@ function resolveBridgePidField(existing = {}, patch = {}) {
 
 export function resolveStateDir(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+  const cacheKey = `${stateRoot}\0${workspaceRoot}`;
+  const cached = stateDirCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
     canonicalWorkspaceRoot = fs.realpathSync.native(workspaceRoot);
@@ -58,13 +96,17 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  const stateDir = path.join(stateRoot, `${slug}-${hash}`);
+  stateDirCache.set(cacheKey, stateDir);
+  return stateDir;
 }
 
 export function resolveStateFile(cwd) {
   return path.join(resolveStateDir(cwd), STATE_FILE_NAME);
+}
+
+export function resolveStateLockFile(cwd) {
+  return path.join(resolveStateDir(cwd), LOCK_FILE_NAME);
 }
 
 export function resolveJobsDir(cwd) {
@@ -96,20 +138,110 @@ function writeFileAtomic(filePath, content) {
     dir,
     `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
   );
-  fs.writeFileSync(tempPath, content, "utf8");
-  replaceFileAtomic(tempPath, filePath);
+  try {
+    fs.writeFileSync(tempPath, content, "utf8");
+    replaceFileAtomic(tempPath, filePath);
+  } catch (error) {
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch {
+    }
+    throw error;
+  }
+}
+
+function processExists(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM" || error?.code === "EACCES";
+  }
+}
+
+function readLockSnapshot(lockPath) {
+  try {
+    const stat = fs.statSync(lockPath);
+    const raw = fs.readFileSync(lockPath, "utf8");
+    let metadata = null;
+    try {
+      metadata = JSON.parse(raw);
+    } catch {
+    }
+    return { stat, raw, metadata };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function recoverStaleLock(lockPath) {
+  const first = readLockSnapshot(lockPath);
+  if (!first) {
+    return true;
+  }
+
+  const ownerPid = Number(first.metadata?.pid);
+  const ageMs = Math.max(0, Date.now() - first.stat.mtimeMs);
+  const ownerExited = Number.isInteger(ownerPid) && ownerPid > 0 && !processExists(ownerPid);
+  if (!ownerExited && ageMs < LOCK_STALE_MS) {
+    return false;
+  }
+
+  const current = readLockSnapshot(lockPath);
+  if (!current) {
+    return true;
+  }
+  if (
+    current.raw !== first.raw ||
+    current.stat.mtimeMs !== first.stat.mtimeMs ||
+    current.stat.size !== first.stat.size
+  ) {
+    return false;
+  }
+
+  try {
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return true;
+    }
+    return false;
+  }
+}
+
+function releaseOwnedLock(lockPath, token) {
+  const snapshot = readLockSnapshot(lockPath);
+  if (!snapshot || snapshot.metadata?.token !== token) {
+    return;
+  }
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+  }
 }
 
 export function withStateLock(cwd, fn) {
   ensureStateDir(cwd);
-  const lockPath = path.join(resolveStateDir(cwd), LOCK_FILE_NAME);
+  const lockPath = resolveStateLockFile(cwd);
 
   for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt += 1) {
     let fd = null;
+    let metadataWritten = false;
+    const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     try {
       fd = fs.openSync(lockPath, "wx");
     } catch (error) {
       if (error?.code === "EEXIST") {
+        if (recoverStaleLock(lockPath)) {
+          continue;
+        }
         sleepMs(LOCK_RETRY_MS);
         continue;
       }
@@ -117,15 +249,25 @@ export function withStateLock(cwd, fn) {
     }
 
     try {
+      fs.writeFileSync(
+        fd,
+        `${JSON.stringify({ pid: process.pid, token, createdAt: nowIso() })}\n`,
+        "utf8"
+      );
+      metadataWritten = true;
       return fn();
     } finally {
       try {
         fs.closeSync(fd);
       } catch {
       }
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
+      if (metadataWritten) {
+        releaseOwnedLock(lockPath, token);
+      } else {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+        }
       }
     }
   }
@@ -144,7 +286,14 @@ function readJobFileIfPresent(cwd, jobId) {
   if (!fs.existsSync(jobFile)) {
     return null;
   }
-  return readJobFile(jobFile);
+  try {
+    return readJobFile(jobFile);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 function writeJobFileUnlocked(cwd, jobId, payload) {
@@ -152,22 +301,94 @@ function writeJobFileUnlocked(cwd, jobId, payload) {
   writeFileAtomic(resolveJobFile(cwd, jobId), `${JSON.stringify(payload, null, 2)}\n`);
 }
 
+function compactIndexText(value, limit) {
+  if (value == null) {
+    return value;
+  }
+  const normalized = String(value).trim().replace(/\s+/g, " ");
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+  return `${normalized.slice(0, limit - 3)}...`;
+}
+
+function projectJobForIndex(job) {
+  const projected = {};
+  for (const field of JOB_INDEX_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(job, field) && job[field] !== undefined) {
+      projected[field] = job[field];
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(projected, "summary")) {
+    projected.summary = compactIndexText(projected.summary, MAX_INDEX_SUMMARY_LENGTH);
+  }
+  if (Object.prototype.hasOwnProperty.call(projected, "errorMessage")) {
+    projected.errorMessage = compactIndexText(projected.errorMessage, MAX_INDEX_ERROR_LENGTH);
+  }
+  return projected;
+}
+
 function upsertJobInState(state, jobPatch) {
   const timestamp = nowIso();
   const existingIndex = state.jobs.findIndex((job) => job.id === jobPatch.id);
   if (existingIndex === -1) {
-    state.jobs.unshift({
+    state.jobs.unshift(projectJobForIndex({
       createdAt: timestamp,
       updatedAt: timestamp,
       ...jobPatch
-    });
+    }));
     return;
   }
-  state.jobs[existingIndex] = {
+  state.jobs[existingIndex] = projectJobForIndex({
     ...state.jobs[existingIndex],
     ...jobPatch,
     updatedAt: timestamp
-  };
+  });
+}
+
+function jobsConflict(existing, candidate) {
+  const active = existing.status === "queued" || existing.status === "running";
+  return active && (Boolean(existing.write) || Boolean(candidate.write));
+}
+
+export function reserveJob(cwd, job) {
+  if (!job?.id) {
+    throw new Error("reserveJob requires a job id.");
+  }
+
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    const existing = state.jobs.find((entry) => entry.id === job.id) ?? null;
+    if (existing) {
+      return { reserved: false, reason: "duplicate", conflict: existing, job: existing };
+    }
+
+    const conflict = state.jobs.find((entry) => jobsConflict(entry, job)) ?? null;
+    if (conflict) {
+      return { reserved: false, reason: "active-conflict", conflict, job: null };
+    }
+
+    const timestamp = nowIso();
+    const reservedJob = {
+      ...job,
+      createdAt: job.createdAt ?? timestamp,
+      updatedAt: timestamp,
+      status: "queued",
+      phase: "queued"
+    };
+    writeJobFileUnlocked(cwd, job.id, reservedJob);
+    upsertJobInState(state, reservedJob);
+    try {
+      saveStateUnlocked(cwd, state);
+    } catch (error) {
+      try {
+        removeJobFile(resolveJobFile(cwd, job.id));
+      } catch {
+      }
+      throw error;
+    }
+    return { reserved: true, reason: "reserved", conflict: null, job: reservedJob };
+  });
 }
 
 /** Claim terminal status for job file + index under one lock. cancelled wins. */
@@ -353,14 +574,27 @@ export function loadState(cwd) {
 }
 
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs]
+    .map(projectJobForIndex)
+    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+  const active = sorted.filter((job) => job.status === "queued" || job.status === "running");
+  const terminalSlots = Math.max(0, MAX_JOBS - active.length);
+  const retainedIds = new Set([
+    ...active.map((job) => job.id),
+    ...sorted
+      .filter((job) => job.status !== "queued" && job.status !== "running")
+      .slice(0, terminalSlots)
+      .map((job) => job.id)
+  ]);
+  return sorted.filter((job) => retainedIds.has(job.id));
 }
 
 function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
+  try {
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch {
   }
 }
 
@@ -377,16 +611,16 @@ function saveStateUnlocked(cwd, state) {
     jobs: nextJobs
   };
 
+  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
+
   const retainedIds = new Set(nextJobs.map((job) => job.id));
   for (const job of previousJobs) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
+    removeFileIfExists(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
-
-  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 

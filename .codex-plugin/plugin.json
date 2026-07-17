@@ -1,7 +1,7 @@
 {
   "name": "grok-build-codex",
-  "version": "0.2.0",
-  "description": "Stateful Grok Build bridge for Codex planning, delegation, monitoring, review, and repair workflows.",
+  "version": "0.3.0",
+  "description": "Stateful Grok Build bridge with detached execution, live progress, usage metrics, and Codex-owned review workflows.",
   "author": {
     "name": "DaMian"
   },
@@ -15,8 +15,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Grok Build Codex",
-    "shortDescription": "Plan in Codex, implement in Grok, then review and validate.",
-    "longDescription": "A stateful bridge from Codex to the local Grok Build CLI with transcript import, foreground and background delegation, run status, stored output, cancellation, session resume, and Codex-owned review gates.",
+    "shortDescription": "Plan in Codex, follow Grok live, then review and validate.",
+    "longDescription": "A fast stateful bridge from Codex to the local Grok Build CLI with detached implementation workers, compact live progress, usage metrics, cancellation, session resume, and Codex-owned review gates.",
     "developerName": "DaMian",
     "category": "Developer Tools",
     "capabilities": [

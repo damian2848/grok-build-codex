@@ -1,18 +1,20 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { main as runUpstreamBridge } from "./upstream/scripts/grok-bridge.mjs";
+import { runImport as importGrokSession } from "./upstream/scripts/lib/grok.mjs";
+import { resolveWorkspaceRoot } from "./upstream/scripts/lib/workspace.mjs";
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const upstreamBridge = path.join(scriptDir, "upstream", "scripts", "grok-bridge.mjs");
 const CODEX_THREAD_ENV = "CODEX_THREAD_ID";
 const CODEX_TRANSCRIPT_ENV = "CODEX_TRANSCRIPT_PATH";
 const DATA_ENV = "GROK_CODEX_DATA";
-const GROK_BINARY_ARGS_ENV = "GROK_BINARY_ARGS_JSON";
 
 function readOption(argv, name) {
   const index = argv.indexOf(name);
@@ -25,17 +27,6 @@ function readOption(argv, name) {
 function resolveCommandCwd(argv) {
   const value = readOption(argv, "--cwd");
   return value ? path.resolve(process.cwd(), value) : process.cwd();
-}
-
-function resolveWorkspaceRoot(cwd) {
-  const result = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
-    encoding: "utf8",
-    windowsHide: true
-  });
-  if (result.status === 0 && result.stdout.trim()) {
-    return path.resolve(result.stdout.trim());
-  }
-  return path.resolve(cwd);
 }
 
 function walkForTranscript(root, threadId) {
@@ -114,62 +105,16 @@ function resolveTranscript(argv, cwd) {
   return realCandidate;
 }
 
-function parseSessionId(raw) {
-  for (const line of String(raw ?? "").split(/\r?\n/).filter(Boolean)) {
-    try {
-      const parsed = JSON.parse(line);
-      const sessionId =
-        parsed.sessionId ?? parsed.session_id ?? parsed.id ?? parsed.importedSessionId ?? parsed.threadId;
-      if (sessionId) {
-        return String(sessionId);
-      }
-    } catch {
-    }
-  }
-
-  const match = String(raw ?? "").match(
-    /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/i
-  );
-  return match?.[0] ?? null;
-}
-
-function resolveGrokBinaryArgs(env) {
-  const raw = env[GROK_BINARY_ARGS_ENV];
-  if (!raw || !String(raw).trim()) {
-    return [];
-  }
-  const parsed = JSON.parse(String(raw));
-  if (!Array.isArray(parsed) || parsed.some((value) => typeof value !== "string")) {
-    throw new Error(`${GROK_BINARY_ARGS_ENV} must be a JSON array of strings.`);
-  }
-  return parsed;
-}
-
 function runImport(argv, env, cwd) {
   const sourcePath = resolveTranscript(argv, cwd);
-  const grokBinary = env.GROK_BINARY || "grok";
-  const result = spawnSync(grokBinary, [...resolveGrokBinaryArgs(env), "import", sourcePath, "--json"], {
-    cwd,
-    env,
-    encoding: "utf8",
-    maxBuffer: 32 * 1024 * 1024,
-    windowsHide: true
-  });
-
-  if (result.error) {
-    throw result.error;
-  }
-  if (result.status !== 0) {
-    throw new Error((result.stderr || result.stdout || `grok import exited ${result.status}`).trim());
-  }
-
-  const rawOutput = result.stdout.trim();
-  const sessionId = parseSessionId(rawOutput);
+  const result = importGrokSession(cwd, { sourcePath, env });
+  const rawOutput = result.stdout;
+  const sessionId = result.threadId;
   const payload = {
     sourcePath,
     threadId: sessionId,
     sessionId,
-    resumeCommand: sessionId ? `grok -r ${sessionId}` : null,
+    resumeCommand: result.resumeCommand ?? (sessionId ? `grok -r ${sessionId}` : null),
     stdout: rawOutput
   };
 
@@ -182,7 +127,32 @@ function runImport(argv, env, cwd) {
   }
 }
 
-function main() {
+function restoreEnvironmentValue(name, value) {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}
+
+async function dispatchUpstream(argv, env) {
+  const previousArgv = process.argv;
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  const previousSessionId = process.env.GROK_CC_SESSION_ID;
+  process.argv = [process.execPath, upstreamBridge, ...argv];
+  process.env.CLAUDE_PLUGIN_DATA = env.CLAUDE_PLUGIN_DATA;
+  restoreEnvironmentValue("GROK_CC_SESSION_ID", env.GROK_CC_SESSION_ID);
+
+  try {
+    await runUpstreamBridge();
+  } finally {
+    process.argv = previousArgv;
+    restoreEnvironmentValue("CLAUDE_PLUGIN_DATA", previousPluginData);
+    restoreEnvironmentValue("GROK_CC_SESSION_ID", previousSessionId);
+  }
+}
+
+async function main() {
   const rawArgs = process.argv.slice(2);
   const aliasMap = new Map([
     ["delegate", "run"],
@@ -208,22 +178,16 @@ function main() {
     return;
   }
 
-  const result = spawnSync(process.execPath, [upstreamBridge, ...argv], {
-    cwd,
-    env,
-    stdio: "inherit",
-    windowsHide: true
+  await dispatchUpstream(argv, env);
+}
+
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMain) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
   });
-
-  if (result.error) {
-    throw result.error;
-  }
-  process.exitCode = result.status ?? (result.signal ? 1 : 0);
 }
 
-try {
-  main();
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-}
+export { main };

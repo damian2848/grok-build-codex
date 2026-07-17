@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import process from "node:process";
@@ -13,6 +14,7 @@ export const DEFAULT_CONTINUE_PROMPT =
 const DEFAULT_BINARY = "grok";
 const BINARY_ENV = "GROK_BINARY";
 const BINARY_ARGS_ENV = "GROK_BINARY_ARGS_JSON";
+const STREAM_PROGRESS_LIMIT = 240;
 
 export function resolveGrokBinary(env = process.env) {
   const override = env?.[BINARY_ENV];
@@ -142,7 +144,7 @@ export function runModelsProbe(cwd, options = {}) {
 }
 
 export function getGrokAuthStatus(cwd, options = {}) {
-  const availability = getGrokAvailability(cwd, options);
+  const availability = options.availability ?? getGrokAvailability(cwd, options);
   if (!availability.available) {
     return {
       available: false,
@@ -174,6 +176,132 @@ function emitProgress(onProgress, message, phase = null, extra = {}) {
   onProgress({ message, phase, ...extra });
 }
 
+function readFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function sumModelMetric(modelUsage, ...keys) {
+  if (!modelUsage || typeof modelUsage !== "object" || Array.isArray(modelUsage)) {
+    return null;
+  }
+  let total = 0;
+  let found = false;
+  for (const usage of Object.values(modelUsage)) {
+    if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+      continue;
+    }
+    for (const key of keys) {
+      const value = readFiniteNumber(usage[key]);
+      if (value != null) {
+        total += value;
+        found = true;
+        break;
+      }
+    }
+  }
+  return found ? total : null;
+}
+
+export function normalizeHeadlessMetrics(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    return null;
+  }
+  const usage = event.usage && typeof event.usage === "object" ? event.usage : {};
+  const inputTokens = readFiniteNumber(usage.input_tokens ?? usage.inputTokens);
+  const cachedInputTokens = readFiniteNumber(
+    usage.cache_read_input_tokens ?? usage.cached_read_input_tokens ?? usage.cachedReadTokens
+  );
+  const outputTokens = readFiniteNumber(usage.output_tokens ?? usage.outputTokens);
+  const reasoningTokens = readFiniteNumber(usage.reasoning_tokens ?? usage.reasoningTokens);
+  const fullInputTokens =
+    inputTokens == null && cachedInputTokens == null
+      ? null
+      : (inputTokens ?? 0) + (cachedInputTokens ?? 0);
+  const totalTokens =
+    readFiniteNumber(usage.total_tokens ?? usage.totalTokens) ??
+    (fullInputTokens == null && outputTokens == null
+      ? null
+      : (fullInputTokens ?? 0) + (outputTokens ?? 0));
+  const modelUsage = event.modelUsage ?? event.model_usage ?? null;
+  const metrics = {
+    inputTokens,
+    cachedInputTokens,
+    fullInputTokens,
+    outputTokens,
+    reasoningTokens,
+    totalTokens,
+    modelCalls: sumModelMetric(modelUsage, "modelCalls", "model_calls"),
+    apiDurationMs: sumModelMetric(modelUsage, "apiDurationMs", "api_duration_ms"),
+    costUsd: readFiniteNumber(event.total_cost_usd ?? event.totalCostUsd),
+    costUsdTicks: readFiniteNumber(event.total_cost_usd_ticks ?? event.totalCostUsdTicks),
+    numTurns: readFiniteNumber(event.num_turns ?? event.numTurns)
+  };
+  return Object.values(metrics).some((value) => value != null) ? metrics : null;
+}
+
+function createVisibleTextStream(onProgress) {
+  let fullText = "";
+  let pending = "";
+  let lastVisible = null;
+
+  const emitSegment = (value) => {
+    const text = String(value ?? "")
+      .trim()
+      .replace(/\s+/g, " ");
+    if (!text) {
+      return;
+    }
+    const visible = text.length <= STREAM_PROGRESS_LIMIT
+      ? text
+      : `${text.slice(0, STREAM_PROGRESS_LIMIT - 3)}...`;
+    if (visible === lastVisible) {
+      return;
+    }
+    lastVisible = visible;
+    emitProgress(onProgress, `Grok: ${visible}`, "running");
+  };
+
+  const drain = (flush = false) => {
+    while (pending) {
+      const boundary = /\r?\n|[.!?。！？](?=\s|$)/.exec(pending);
+      if (boundary) {
+        const end = boundary.index + boundary[0].length;
+        emitSegment(pending.slice(0, end));
+        pending = pending.slice(end).trimStart();
+        continue;
+      }
+      if (pending.length >= STREAM_PROGRESS_LIMIT) {
+        emitSegment(pending);
+      }
+      if (flush) {
+        emitSegment(pending);
+        pending = "";
+      }
+      break;
+    }
+  };
+
+  return {
+    push(value) {
+      const text = String(value ?? "");
+      if (!text) {
+        return;
+      }
+      const separator = fullText && /[.!?。！？]\s*$/.test(fullText) && !/^\s/.test(text)
+        ? "\n\n"
+        : "";
+      fullText += `${separator}${text}`;
+      pending += `${separator}${text}`;
+      drain(false);
+    },
+    finish() {
+      drain(true);
+      return fullText.trimEnd();
+    }
+  };
+}
+
 function buildHeadlessArgs(prompt, options = {}) {
   const args = [];
 
@@ -185,7 +313,11 @@ function buildHeadlessArgs(prompt, options = {}) {
     args.push("--session-id", options.sessionId);
   }
 
-  args.push("-p", prompt);
+  if (options.promptFile) {
+    args.push("--prompt-file", options.promptFile);
+  } else {
+    args.push("-p", prompt);
+  }
 
   if (options.cwd) {
     args.push("--cwd", options.cwd);
@@ -222,6 +354,33 @@ function buildHeadlessArgs(prompt, options = {}) {
   return args;
 }
 
+function createTemporaryPromptFile(prompt, options = {}) {
+  const tempRoot = path.resolve(options.tempRoot ?? os.tmpdir());
+  fs.mkdirSync(tempRoot, { recursive: true });
+  const tempDir = fs.mkdtempSync(path.join(tempRoot, "grok-codex-prompt-"));
+  const promptFile = path.join(tempDir, "prompt.md");
+  try {
+    fs.writeFileSync(promptFile, prompt, { encoding: "utf8", mode: 0o600 });
+  } catch (error) {
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+    }
+    throw error;
+  }
+  return { tempDir, promptFile };
+}
+
+function removeTemporaryPromptFile(artifact) {
+  if (!artifact) {
+    return;
+  }
+  try {
+    fs.rmSync(artifact.tempDir, { recursive: true, force: true });
+  } catch {
+  }
+}
+
 export function runHeadlessAgent(cwd, options = {}) {
   const env = options.env ?? process.env;
   const binary = options.binary ?? resolveGrokBinary(env);
@@ -235,23 +394,47 @@ export function runHeadlessAgent(cwd, options = {}) {
     ? options.resumeSessionId
     : options.sessionId || (options.assignSessionId === false ? null : crypto.randomUUID());
 
-  const args = buildHeadlessArgs(prompt, {
-    ...options,
-    cwd: options.cwd ?? cwd,
-    sessionId: options.resumeSessionId || options.continueLast ? undefined : sessionId
-  });
+  let promptArtifact;
+  try {
+    promptArtifact = createTemporaryPromptFile(prompt, {
+      tempRoot: options.promptTempRoot
+    });
+  } catch (error) {
+    return Promise.reject(error);
+  }
+
+  let args;
+  try {
+    args = buildHeadlessArgs(prompt, {
+      ...options,
+      cwd: options.cwd ?? cwd,
+      promptFile: promptArtifact.promptFile,
+      sessionId: options.resumeSessionId || options.continueLast ? undefined : sessionId
+    });
+  } catch (error) {
+    removeTemporaryPromptFile(promptArtifact);
+    return Promise.reject(error);
+  }
 
   const platform = options.platform ?? process.platform;
   const detached = options.detached ?? platform !== "win32";
 
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, [...binaryArgs, ...args], {
-      cwd,
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached,
-      windowsHide: true
-    });
+    const spawnImpl = options.spawnImpl ?? spawn;
+    let child;
+    try {
+      child = spawnImpl(binary, [...binaryArgs, ...args], {
+        cwd,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached,
+        windowsHide: true
+      });
+    } catch (error) {
+      removeTemporaryPromptFile(promptArtifact);
+      reject(error);
+      return;
+    }
 
     const agentPid = child.pid ?? null;
     emitProgress(options.onProgress, `Running grok (${binary}).`, "starting", {
@@ -260,39 +443,95 @@ export function runHeadlessAgent(cwd, options = {}) {
       pid: agentPid
     });
 
+    const streamingJson = options.outputFormat === "streaming-json";
+    const visibleText = createVisibleTextStream(options.onProgress);
     let stdout = "";
     let stderr = "";
+    let streamBuffer = "";
+    let endEvent = null;
+    let streamError = null;
+
+    const consumeStreamingLine = (line) => {
+      const normalized = String(line ?? "").trim();
+      if (!normalized) {
+        return;
+      }
+      let event;
+      try {
+        event = JSON.parse(normalized);
+      } catch {
+        visibleText.push(`${line}\n`);
+        return;
+      }
+      if (event.type === "text") {
+        visibleText.push(event.data ?? "");
+      } else if (event.type === "end") {
+        endEvent = event;
+      } else if (event.type === "error") {
+        streamError = String(event.message ?? "Grok streaming error");
+        emitProgress(options.onProgress, `Grok error: ${streamError}`, "failed");
+      } else if (event.type === "max_turns_reached") {
+        emitProgress(options.onProgress, "Grok reached its maximum turn limit.", "finalizing");
+      }
+    };
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      stdout += chunk;
+      if (!streamingJson) {
+        stdout += chunk;
+        return;
+      }
+      streamBuffer += chunk;
+      const lines = streamBuffer.split(/\r?\n/);
+      streamBuffer = lines.pop() ?? "";
+      for (const line of lines) {
+        consumeStreamingLine(line);
+      }
     });
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
     });
 
     child.on("error", (error) => {
+      removeTemporaryPromptFile(promptArtifact);
       reject(error);
     });
 
     child.on("close", (code, signal) => {
-      const status = code ?? (signal ? 1 : 0);
+      removeTemporaryPromptFile(promptArtifact);
+      const processStatus = code ?? (signal ? 1 : 0);
+      if (streamingJson && streamBuffer) {
+        consumeStreamingLine(streamBuffer);
+      }
+      const status = processStatus === 0 && streamError ? 1 : processStatus;
+      const visibleMessage = streamingJson ? visibleText.finish() : stdout.trimEnd();
+      const resolvedSessionId =
+        endEvent?.sessionId ?? endEvent?.session_id ?? sessionId;
+      const metrics = normalizeHeadlessMetrics(endEvent);
+      if (streamError && !stderr.includes(streamError)) {
+        stderr = `${stderr}${stderr ? "\n" : ""}${streamError}`;
+      }
+      const finalMessage = visibleMessage || streamError || "";
       emitProgress(
         options.onProgress,
         status === 0 ? "Grok finished." : `Grok exited with status ${status}.`,
         status === 0 ? "finalizing" : "failed",
-        { threadId: sessionId, agentPid }
+        { threadId: resolvedSessionId, agentPid }
       );
       resolve({
         status,
         signal,
-        stdout,
+        stdout: finalMessage,
         stderr,
-        sessionId,
-        threadId: sessionId,
+        sessionId: resolvedSessionId,
+        threadId: resolvedSessionId,
         agentPid,
-        finalMessage: stdout.trimEnd(),
+        finalMessage,
+        metrics,
+        usage: endEvent?.usage ?? null,
+        modelUsage: endEvent?.modelUsage ?? endEvent?.model_usage ?? null,
+        endEvent,
         args,
         binary
       });

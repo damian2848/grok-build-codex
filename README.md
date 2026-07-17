@@ -8,7 +8,7 @@
 
 A stateful Codex plugin that lets **Codex plan, design, review, and accept**, while the local **Grok Build CLI implements the code**.
 
-The plugin creates a durable collaboration contract in the repository, delegates bounded implementation tasks to Grok, tracks foreground or background runs, resumes repair sessions, and returns control to Codex for independent diff review and validation.
+The plugin creates a compact collaboration contract in the repository, starts Grok in a detached worker, streams live implementation progress back to Codex, resumes focused repair sessions, and returns control to Codex for independent diff review and validation.
 
 ## Workflow
 
@@ -16,8 +16,10 @@ The plugin creates a durable collaboration contract in the repository, delegates
 flowchart LR
     U[User request] --> C[Codex planning and architecture]
     C --> H[.ai-collab handoff files]
-    H --> B[Stateful bridge]
+    H --> B[Detached bridge worker]
     B --> G[Grok Build CLI implementation]
+    B --> P[Live progress follower]
+    P --> C
     G --> W[Worktree changes]
     W --> R[Codex review and validation]
     R -->|repair required| H
@@ -29,12 +31,18 @@ flowchart LR
 - Keeps requirements, architecture, acceptance criteria, and review decisions owned by Codex.
 - Shares durable context through `.ai-collab/` instead of relying on hidden model state.
 - Optionally imports the current Codex JSONL transcript into a Grok session.
-- Runs foreground or tracked background implementation jobs.
+- Runs implementation in a detached worker and follows it with compact live JSONL events.
 - Stores job state, logs, worker PID, Grok PID, output, and resumable Grok thread IDs.
+- Keeps the shared job index metadata-only so large prompts and outputs are not reparsed on every follower refresh.
+- Keeps the Grok worker running if the follower is interrupted or times out.
+- Reports terminal duration, thread ID, token usage, API duration, turns, and cost when Grok provides them.
+- Streams visible Grok text while discarding `thought` events and private reasoning.
+- Launches Grok directly without a version preflight; startup and authentication failures become tracked terminal events.
 - Supports `check`, `run`, `runs`, `show`, `stop`, `run-resume-candidate`, and `import`.
 - Uses cancellation-first terminal-state handling so a late worker cannot overwrite `cancelled` with `completed`.
+- Atomically blocks overlapping jobs when either job can write, recovers stale state locks, and preserves all active jobs before pruning terminal history.
 - Prevents delegated instructions from authorizing commits, pushes, branch switching, destructive Git commands, or credential edits.
-- Supports macOS, Linux, and Windows with Node entry points, POSIX `.sh` wrappers, Windows `.cmd` wrappers, and `taskkill` process-tree cancellation.
+- Supports macOS, Linux, and Windows with Node entry points, POSIX `.sh` wrappers, Windows `.cmd` wrappers, private temporary prompt files, and `taskkill` process-tree cancellation.
 
 ## Requirements
 
@@ -42,6 +50,8 @@ flowchart LR
 - Node.js `>= 18.18.0`.
 - Git.
 - A locally installed and authenticated Grok Build CLI.
+
+When Codex itself runs in a sandbox, the bridge also needs outbound network access and write access to Grok's session directory. On POSIX systems this is normally `$HOME/.grok`; on Windows it is `%USERPROFILE%\.grok`.
 
 Verify Grok before installing the plugin:
 
@@ -87,7 +97,31 @@ Start a new Codex task and ask:
 Use $delegate-to-grok to plan this task, delegate implementation to Grok, and review the result.
 ```
 
-Codex will inspect the repository, initialize `.ai-collab/`, write the plan and acceptance criteria, delegate a bounded task, inspect the resulting diff, run validation, and either accept the work or send a focused repair request back to the same Grok thread.
+Codex will inspect the repository, write a compact task packet, start a detached Grok worker, show live progress, inspect the resulting diff once, run the declared validation, and either accept the work or send one focused repair request back to the same Grok thread.
+
+## Live Progress
+
+The default delegation command starts a background worker and follows it in one invocation:
+
+```console
+node scripts/grok-bridge.mjs run --background --follow --stream --write --fresh --cwd /path/to/repository --prompt-file .ai-collab/task.md --model sub2api-grok
+```
+
+It emits compact newline-delimited JSON that a Codex task can display as progress:
+
+```json
+{"type":"job.started","jobId":"task-...","status":"queued","progress":"Queued for background execution.","watcherDetachedSafe":true}
+{"type":"job.progress","jobId":"task-...","status":"running","phase":"running","elapsed":"4s","progress":"Updating the bridge tests.","watcherDetachedSafe":true}
+{"type":"job.completed","jobId":"task-...","status":"completed","duration":"8s","threadId":"...","metrics":{"totalTokens":220},"watcherDetachedSafe":true}
+```
+
+`job.timeout` means only the follower stopped waiting. The detached Grok worker continues. Reconnect without starting another worker:
+
+```console
+node scripts/grok-bridge.mjs runs JOB_ID --follow --stream --cwd /path/to/repository
+```
+
+Use one lightweight, read-only Codex monitor subagent only for a long Grok run when the main agent has non-conflicting work. Normal tasks should use the built-in follower directly to avoid extra orchestration latency and tokens.
 
 ## Collaboration Files
 
@@ -107,7 +141,8 @@ Use the platform-independent Node entry point:
 
 ```console
 node scripts/grok-bridge.mjs check --cwd /path/to/repository --json
-node scripts/grok-bridge.mjs run --write --fresh --cwd /path/to/repository --prompt-file .ai-collab/task.md --json
+node scripts/grok-bridge.mjs run --background --follow --stream --write --fresh --cwd /path/to/repository --prompt-file .ai-collab/task.md --model sub2api-grok
+node scripts/grok-bridge.mjs runs JOB_ID --follow --stream --cwd /path/to/repository
 node scripts/grok-bridge.mjs runs --cwd /path/to/repository --json
 node scripts/grok-bridge.mjs show JOB_ID --cwd /path/to/repository --json
 node scripts/grok-bridge.mjs stop JOB_ID --cwd /path/to/repository --json
@@ -150,7 +185,9 @@ npm test
 node --check scripts/grok-bridge.mjs
 ```
 
-The test suite includes cross-platform Node entry points and simulated Windows coverage for command execution, process-tree cancellation, and state-file replacement. GitHub Actions runs the suite on Linux, macOS, and Windows.
+The test suite includes cross-platform Node entry points, background-state race coverage, compact-index checks, worker bootstrap failure handling, and simulated Windows coverage for command execution, prompt files, process-tree cancellation, and state-file replacement. GitHub Actions runs the suite on Linux, macOS, and Windows.
+
+The optimized path dispatches the adapter in-process, caches repository resolution, keeps `state.json` compact, and invokes Grok once with `--prompt-file`. Normal runs do not execute `grok version` or `grok models` first; launch and authentication failures are recorded on the tracked job. Use `check --json` only for setup, authentication changes, or after such a failure.
 
 ## Attribution
 

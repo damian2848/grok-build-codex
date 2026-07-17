@@ -39,6 +39,19 @@ test("Windows cancellation terminates the full process tree with taskkill", () =
   assert.equal(result.method, "taskkill");
 });
 
+test("process-tree cancellation rejects non-positive PIDs", () => {
+  let called = false;
+  const result = terminateProcessTree(0, {
+    platform: "win32",
+    runCommandImpl() {
+      called = true;
+      return { status: 0, stdout: "", stderr: "", signal: null, error: null };
+    }
+  });
+  assert.equal(result.attempted, false);
+  assert.equal(called, false);
+});
+
 test("Windows state replacement removes an existing destination before retrying", () => {
   const operations = [];
   let renameAttempts = 0;
