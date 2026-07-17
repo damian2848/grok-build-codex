@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "phase": "initialized",
+  "last_job_id": "",
+  "grok_thread_id": "",
+  "iteration": 0,
+  "max_iterations": 3,
+  "baseline_commit": "",
+  "last_result": "",
+  "updated_at": ""
+}

@@ -1,0 +1,20 @@
+{
+  "name": "grok-build-codex",
+  "interface": {
+    "displayName": "Grok Build Codex"
+  },
+  "plugins": [
+    {
+      "name": "grok-build-codex",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

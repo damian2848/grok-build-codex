@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegate to Grok"
+  short_description: "Plan in Codex, implement in Grok, then review and validate"
+  default_prompt: "Use $delegate-to-grok to plan this task, delegate implementation to Grok, and review the resulting changes."

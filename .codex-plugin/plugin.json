@@ -1,0 +1,32 @@
+{
+  "name": "grok-build-codex",
+  "version": "0.2.0",
+  "description": "Stateful Grok Build bridge for Codex planning, delegation, monitoring, review, and repair workflows.",
+  "author": {
+    "name": "DaMian"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "grok",
+    "delegation",
+    "code-review",
+    "orchestration"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Grok Build Codex",
+    "shortDescription": "Plan in Codex, implement in Grok, then review and validate.",
+    "longDescription": "A stateful bridge from Codex to the local Grok Build CLI with transcript import, foreground and background delegation, run status, stored output, cancellation, session resume, and Codex-owned review gates.",
+    "developerName": "DaMian",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Automation",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use $delegate-to-grok to plan this task, delegate implementation to Grok, and review the result.",
+      "Check whether the Grok Build bridge is ready and show recent tracked runs.",
+      "Import this Codex task into Grok, then prepare a bounded implementation handoff."
+    ]
+  }
+}
